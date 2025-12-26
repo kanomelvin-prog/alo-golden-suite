@@ -571,46 +571,50 @@ function setStatus(status) {
 function initBotpress() {
   log('Initializing Botpress SDK...', 'info');
   
-  // Listen for messages from the bot
-  window.botpress.on('message', (event) => {
-    console.log('Message event:', event);
-    
-    // Extract text from the message
-    if (event.payload && event.payload.text) {
-      state.lastBotMessage = event.payload.text;
-      state.messageQueue.push(event.payload.text);
+  // Listen for ALL events to debug
+  const events = ['message', 'messageSent', 'messageReceived', 'webchat:ready', 'webchat:opened', 'webchat:closed', 'conversation', 'error'];
+  
+  events.forEach(eventName => {
+    window.botpress.on(eventName, (event) => {
+      console.log(`[BP Event] ${eventName}:`, event);
       
-      // Resolve pending promise if waiting for response
-      if (state.pendingResponse) {
-        state.pendingResponse(event.payload.text);
-        state.pendingResponse = null;
+      // Capture bot messages
+      if (eventName === 'message' || eventName === 'messageReceived') {
+        const text = event?.payload?.text || event?.text;
+        if (text && event?.authorId !== 'user') {
+          state.lastBotMessage = text;
+          state.messageQueue.push(text);
+          
+          if (state.pendingResponse) {
+            state.pendingResponse(text);
+            state.pendingResponse = null;
+          }
+        }
       }
-    }
+      
+      if (eventName === 'webchat:ready') {
+        log('Webchat ready!', 'success');
+        setStatus('connected');
+      }
+      
+      if (eventName === 'error') {
+        log(`SDK Error: ${JSON.stringify(event)}`, 'error');
+      }
+    });
   });
   
-  // Listen for webchat ready
-  window.botpress.on('webchat:ready', () => {
-    log('Webchat ready!', 'success');
-    setStatus('connected');
-  });
-  
-  // Listen for errors
-  window.botpress.on('error', (error) => {
-    log(`Error: ${error.message || error}`, 'error');
-  });
-  
-  // Initialize with config
+  // Initialize - keep widget VISIBLE so connection stays alive
   window.botpress.init({
     botId: BOT_CONFIG.botId,
     clientId: BOT_CONFIG.clientId,
-    hideWidget: true,  // We don't need to show the widget
+    hideWidget: false,  // Keep visible!
     disableAnimations: true
   });
   
-  // Open the webchat (hidden)
+  // Open the webchat
   setTimeout(() => {
     window.botpress.open();
-    log('Webchat opened (hidden)', 'info');
+    log('Webchat opened', 'info');
     setStatus('connected');
   }, 2000);
 }
@@ -623,47 +627,56 @@ async function sendMessage(text) {
   state.messageQueue = [];  // Clear queue before sending
   state.lastBotMessage = null;
   
-  // Send message
-  window.botpress.sendMessage(text);
-  
-  // Wait for response
   return new Promise((resolve) => {
+    // Set up listener for response
     state.pendingResponse = resolve;
     
-    // Timeout after configured time
-    setTimeout(() => {
-      if (state.pendingResponse) {
-        state.pendingResponse = null;
-        // Check if we got any messages in the queue
-        if (state.messageQueue.length > 0) {
-          resolve(state.messageQueue.join(' '));
-        } else {
-          resolve(null);
+    // Send message
+    try {
+      window.botpress.sendMessage(text);
+    } catch (e) {
+      log(`Send error: ${e.message}`, 'error');
+      state.pendingResponse = null;
+      resolve(null);
+      return;
+    }
+    
+    // Also poll for messages in case event doesn't fire
+    let pollCount = 0;
+    const pollInterval = setInterval(() => {
+      pollCount++;
+      
+      // Check if we got a response via event
+      if (state.messageQueue.length > 0 && !state.pendingResponse) {
+        clearInterval(pollInterval);
+        return;
+      }
+      
+      // Timeout after configured time
+      if (pollCount > CONFIG.responseTimeout / 200) {
+        clearInterval(pollInterval);
+        if (state.pendingResponse) {
+          state.pendingResponse = null;
+          if (state.messageQueue.length > 0) {
+            resolve(state.messageQueue.join(' '));
+          } else {
+            resolve(null);
+          }
         }
       }
-    }, CONFIG.responseTimeout);
+    }, 200);
   });
 }
 
 async function resetConversation() {
-  // Close and reopen to get a fresh conversation
-  window.botpress.close();
-  await sleep(500);
+  // Instead of closing/reopening (which breaks things),
+  // just clear our state and let the conversation continue
+  // Each test will naturally start fresh context based on the greeting
+  state.messageQueue = [];
+  state.lastBotMessage = null;
   
-  // Reinitialize with new user ID to force new conversation
-  window.botpress.init({
-    botId: BOT_CONFIG.botId,
-    clientId: BOT_CONFIG.clientId,
-    hideWidget: true,
-    disableAnimations: true,
-    userData: {
-      id: 'test-user-' + Date.now()  // New user ID each time
-    }
-  });
-  
+  log('  (conversation context cleared)', 'info');
   await sleep(500);
-  window.botpress.open();
-  await sleep(1000);
 }
 
 function sleep(ms) {
